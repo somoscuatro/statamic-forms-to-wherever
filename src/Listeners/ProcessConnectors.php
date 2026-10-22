@@ -1,0 +1,93 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Somoscuatro\FormsToWherever\Listeners;
+
+use Illuminate\Support\Facades\Log;
+use Somoscuatro\FormsToWherever\ConfigurationParser;
+use Somoscuatro\FormsToWherever\ConnectorManager;
+use Somoscuatro\FormsToWherever\Jobs\ProcessConnectorJob;
+use Statamic\Events\FormSubmitted;
+
+class ProcessConnectors
+{
+    public function __construct(
+        protected ConnectorManager $connectorManager,
+        protected ConfigurationParser $configParser
+    ) {}
+
+    public function handle(FormSubmitted $event): void
+    {
+        $submission = $event->submission;
+        $form = $submission->form();
+
+        $connectorFields = $form->blueprint()->fields()->all()->filter(function ($field) {
+            return $field->type() === 'form_connectors';
+        });
+
+        if ($connectorFields->isEmpty()) {
+            return;
+        }
+
+        foreach ($connectorFields as $fieldHandle => $field) {
+            $fieldConfig = $field->config();
+
+            // Check condition — skip this connector field if condition isn't met
+            $conditionField = $fieldConfig['condition_field'] ?? null;
+            $conditionValue = $fieldConfig['condition_value'] ?? null;
+
+            if ($conditionField) {
+                $submissionValue = $submission->get($conditionField);
+                if ((string) $submissionValue !== (string) $conditionValue) {
+                    continue;
+                }
+            }
+
+            $connectors = $this->configParser->parseFromBlueprint($fieldConfig);
+            $useAsync = $fieldConfig['async_processing'] ?? true;
+            $throwOnError = $fieldConfig['throw_on_error'] ?? false;
+
+            foreach ($connectors as $connectorConfig) {
+                if ($useAsync) {
+                    ProcessConnectorJob::dispatch(
+                        $submission,
+                        $connectorConfig['type'],
+                        $connectorConfig
+                    );
+                } else {
+                    $this->processSynchronously($submission, $connectorConfig, $throwOnError);
+                }
+            }
+        }
+    }
+
+    protected function processSynchronously($submission, array $connectorConfig, bool $throwOnError = false): void
+    {
+        $connector = $this->connectorManager->get($connectorConfig['type']);
+
+        if (!$connector) {
+            Log::warning('Unknown connector type', [
+                'type' => $connectorConfig['type'],
+                'form' => $submission->form()->handle(),
+                'submission_id' => $submission->id(),
+            ]);
+            return;
+        }
+
+        try {
+            $connector->process($submission, $connectorConfig);
+        } catch (\Exception $e) {
+            Log::error('Connector processing failed', [
+                'connector' => $connectorConfig['type'],
+                'error' => $e->getMessage(),
+                'form' => $submission->form()->handle(),
+                'submission_id' => $submission->id(),
+            ]);
+
+            if ($throwOnError) {
+                throw $e;
+            }
+        }
+    }
+}
